@@ -1,0 +1,6 @@
+streamlit
+pandas
+moviepy
+requests
+feedparser
+openai

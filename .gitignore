@@ -1,0 +1,24 @@
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments and local config
+.venv/
+.env
+**/.env
+.env.*
+
+# Editor/OS noise
+.vscode/
+.DS_Store
+
+# Large media artifacts 
+src/rendered_clips/
+src/sources/
+*.mp4
+*.mov
+*.mkv
+*.webm
+
+# Streamlit cache
+.streamlit/
