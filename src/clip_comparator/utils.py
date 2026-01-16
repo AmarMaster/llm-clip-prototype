@@ -1,5 +1,6 @@
 import json
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -12,19 +13,9 @@ from .models import ClipSegment
 # ----------------------------
 
 def _time_to_ms(val: Any, assume_seconds: bool = False) -> Optional[int]:
-    """
-    Normalize time values to milliseconds.
-    Handles:
-    - Already-ms values (large numbers)
-    - Seconds (int/float)
-    - Optional minutes:seconds encoded as float with decimal seconds (e.g., 96.26 -> 96m 26s) when assume_seconds=False and value looks like mm.ss
-    - Strings with ":" (hh:mm:ss or mm:ss)
-    When assume_seconds=True, numeric values are treated as seconds (no minutes heuristic).
-    """
     if val is None:
         return None
 
-    # Try string formats first
     if isinstance(val, str):
         s = val.strip()
         if not s:
@@ -34,7 +25,7 @@ def _time_to_ms(val: Any, assume_seconds: bool = False) -> Optional[int]:
             try:
                 parts_f = [float(p) for p in parts]
                 while len(parts_f) < 3:
-                    parts_f.insert(0, 0.0)  # pad to hh:mm:ss
+                    parts_f.insert(0, 0.0)
                 hours, minutes, seconds = parts_f[-3], parts_f[-2], parts_f[-1]
                 total_sec = hours * 3600 + minutes * 60 + seconds
                 return int(total_sec * 1000)
@@ -45,25 +36,19 @@ def _time_to_ms(val: Any, assume_seconds: bool = False) -> Optional[int]:
         except Exception:
             return None
 
-    # Numeric handling
     try:
         num = float(val)
     except Exception:
         return None
 
-    # If it's already a big number, assume ms
     if num >= 100000:
         return int(num)
-
-    # If it's in the range of typical clip durations in ms (>= 1s), but less than 100k, still assume ms
     if num >= 1000:
         return int(num)
 
-    # When assume_seconds=True, treat numeric as seconds directly
     if assume_seconds:
         return int(num * 1000)
 
-    # Heuristic: value like 96.26 likely means 96 minutes 26 seconds (mm.ss), cap to reasonable minutes
     frac = num - int(num)
     if 60 <= num <= 1000 and frac < 0.6:
         minutes = int(num)
@@ -71,96 +56,10 @@ def _time_to_ms(val: Any, assume_seconds: bool = False) -> Optional[int]:
         total_sec = minutes * 60 + seconds
         return int(total_sec * 1000)
 
-    # Otherwise treat as seconds (can be fractional)
     return int(num * 1000)
 
-def _seconds_or_mmss_to_ms(val: Any) -> Optional[int]:
-    """
-    Interpret numeric as seconds, but if it looks like mm.ss (e.g., 96.26 meaning 96m 26s),
-    convert accordingly. This is for Headliner-style floats where end-start would otherwise
-    be ~1 second instead of ~60 seconds.
-    """
-    if val is None:
-        return None
-    try:
-        num = float(val)
-    except Exception:
-        return _time_to_ms(val, assume_seconds=True)
-
-    frac = num - int(num)
-    # If it looks like mm.ss (fraction less than ~0.6), treat as minutes:seconds.
-    if num >= 60 and frac < 0.6:
-        minutes = int(num)
-        seconds = int(round(frac * 100))
-        total_sec = minutes * 60 + seconds
-        return int(total_sec * 1000)
-    # Otherwise, if it's >= 60, treat it as decimal minutes (e.g., 96.75 mins)
-    if num >= 60:
-        return int(num * 60 * 1000)
-    # Fallback: treat as seconds.
-    return int(num * 1000)
-
-def _headliner_minutes_to_ms(val: Any) -> Optional[int]:
-    """
-    Headliner-specific: treat numeric values as minutes with fractional seconds in mm.ss form.
-    Examples:
-    - 96.26 -> 96 minutes 26 seconds
-    - 1.05 -> 1 minute 05 seconds
-    Strings with ":" are parsed as hh:mm:ss/mm:ss.
-    """
-    if val is None:
-        return None
-    if isinstance(val, str):
-        if ":" in val:
-            return _time_to_ms(val, assume_seconds=False)
-        try:
-            val = float(val.strip())
-        except Exception:
-            return None
-    try:
-        num = float(val)
-    except Exception:
-        return None
-    minutes = int(num)
-    seconds = int((num - minutes) * 100)
-    total_sec = minutes * 60 + seconds
-    return int(total_sec * 1000)
-
-def _headliner_field_to_ms(val: Any) -> Optional[int]:
-    """
-    Headliner-specific parser for any time field (including *Millis when they are actually mm.ss).
-    - If value is large (>=100000), assume it's already milliseconds.
-    - If value is a time string with ":", parse as hh:mm:ss/mm:ss.
-    - Otherwise, treat numeric as minutes.seconds (mm.ss).
-    """
-    if val is None:
-        return None
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return None
-        if ":" in s:
-            return _time_to_ms(s, assume_seconds=False)
-        try:
-            val = float(s)
-        except Exception:
-            return None
-    try:
-        num = float(val)
-    except Exception:
-        return None
-    if num >= 100000:
-        return int(num)
-    minutes = int(num)
-    seconds = int(round((num - minutes) * 100))
-    total_sec = minutes * 60 + seconds
-    return int(total_sec * 1000)
 
 def _ms_field_to_int(val: Any) -> Optional[int]:
-    """
-    For fields explicitly labeled as *Millis, treat the value as milliseconds.
-    Accepts ints/floats/strings; hh:mm:ss strings are also supported.
-    """
     if val is None:
         return None
     if isinstance(val, str):
@@ -187,7 +86,7 @@ def _ms_field_to_int(val: Any) -> Optional[int]:
     except Exception:
         return None
 
-# ----------------------------
+
 def ms_to_timestamp(ms: Optional[int]) -> str:
     if ms is None:
         return ""
@@ -196,16 +95,17 @@ def ms_to_timestamp(ms: Optional[int]) -> str:
     seconds = total_sec % 60
     return f"{minutes:02d}:{seconds:02d}"
 
+
 # ----------------------------
 # AssemblyAI parsing
 # ----------------------------
 
 def parse_assembly_json(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract episode_id, transcript text, and optional word timestamps from AssemblyAI JSON."""
     episode_id = str(data.get("id") or "episode_1")
     transcript = data.get("text") or ""
     words = data.get("words") or []
     return {"episode_id": episode_id, "transcript": transcript, "words": words}
+
 
 def build_clip_text_from_words(words: List[Dict[str, Any]], start_ms: int, end_ms: int) -> str:
     if not words:
@@ -225,8 +125,9 @@ def build_clip_text_from_words(words: List[Dict[str, Any]], start_ms: int, end_m
             toks.append(t)
     return " ".join(toks)
 
+
 # ----------------------------
-# Headliner clips parsing
+# Clips parsing
 # ----------------------------
 
 def _parse_clip_items(raw: Any) -> List[Dict[str, Any]]:
@@ -240,19 +141,17 @@ def _parse_clip_items(raw: Any) -> List[Dict[str, Any]]:
         raise ValueError("Unsupported clips JSON format. Expect list or object with 'clips'/'segments'.")
     return [c for c in clip_items if isinstance(c, dict)]
 
+
 def parse_headliner_clips(
     raw: Any,
     episode_id: str,
     assembly_words: Optional[List[Dict[str, Any]]] = None,
 ) -> List[ClipSegment]:
-    """Parse Headliner clips prioritizing explicit *Millis fields (ms); otherwise treat numbers as seconds."""
     clip_items = _parse_clip_items(raw)
     clips: List[ClipSegment] = []
     for i, c in enumerate(clip_items):
-
         clip_id = str(c.get("id") or c.get("clip_id") or c.get("clipId") or f"clip_{i+1}")
 
-        # Prefer Headliner-provided millis; otherwise treat numeric as seconds.
         start_ms = _ms_field_to_int(_first_not_none(c.get("startMillis"), c.get("start_ms")))
         if start_ms is None:
             start_ms = _time_to_ms(c.get("start"), assume_seconds=True)
@@ -261,7 +160,6 @@ def parse_headliner_clips(
         if dur is None:
             dur = _time_to_ms(c.get("duration"), assume_seconds=True)
 
-        # Compute end strictly as start + duration when both exist; otherwise fall back to any provided end.
         end_ms = None
         if start_ms is not None and dur is not None:
             end_ms = start_ms + dur
@@ -286,15 +184,12 @@ def parse_headliner_clips(
         )
     return clips
 
+
 def parse_llm_style_clips(
     raw: Any,
     episode_id: str,
     assembly_words: Optional[List[Dict[str, Any]]] = None,
 ) -> List[ClipSegment]:
-    """
-    Parse LLM-style clips where timestamps are expected to be milliseconds (startMillis/endMillis),
-    and plain start/end/duration are treated as seconds.
-    """
     clip_items = _parse_clip_items(raw)
     clips: List[ClipSegment] = []
     for i, c in enumerate(clip_items):
@@ -334,88 +229,610 @@ def parse_llm_style_clips(
         )
     return clips
 
+
 # ----------------------------
-# LLM timestamp attachment by matching text -> words[]
+# Normalization / tokenization
 # ----------------------------
 
 _WORD_RE = re.compile(r"[A-Za-z0-9']+")
 
+_PUNCT_MAP = {
+    "\u2019": "'",  # ’
+    "\u2018": "'",  # ‘
+    "\u201C": '"',  # “
+    "\u201D": '"',  # ”
+    "\u2014": "-",  # —
+    "\u2013": "-",  # –
+    "\u00A0": " ",  # nbsp
+}
+
+def _normalize_text(s: str) -> str:
+    s = s or ""
+    s = unicodedata.normalize("NFKC", s)
+    for k, v in _PUNCT_MAP.items():
+        s = s.replace(k, v)
+    return s
+
 def _norm_token(t: str) -> str:
-    return t.strip().lower()
+    return _normalize_text(t).strip().lower()
 
 def _tokenize_text(s: str) -> List[str]:
-    return [_norm_token(x) for x in _WORD_RE.findall(s or "") if x.strip()]
+    s = _normalize_text(s or "")
+    return [_norm_token(x) for x in _WORD_RE.findall(s) if x.strip()]
 
-def find_clip_span_in_words(
-    words: List[Dict[str, Any]],
-    clip_text: str
-) -> Optional[Tuple[int, int]]:
-    """
-    Find (start_ms, end_ms) by locating the clip_text tokens as a contiguous subsequence in words[] tokens.
-    Requires AssemblyAI words with start/end.
-    """
-    if not words:
-        return None
+def _tokens_from_word_text(word_text: str) -> List[str]:
+    return _tokenize_text(word_text or "")
 
-    needle = _tokenize_text(clip_text)
-    if not needle:
-        return None
 
-    hay = []
-    starts = []
-    ends = []
-    for w in words:
-        txt = str(w.get("text") or "")
+# ----------------------------
+# Build indexed transcript tokens from words[]
+# ----------------------------
+
+def build_words_index(words: List[Dict[str, Any]]) -> Dict[str, Any]:
+    tokens: List[str] = []
+    starts: List[int] = []
+    ends: List[int] = []
+    pos: Dict[str, List[int]] = {}
+
+    for w in words or []:
         ws = w.get("start")
         we = w.get("end")
         if ws is None or we is None:
             continue
-        tok = _norm_token(txt)
-        if not tok:
+
+        wtoks = _tokens_from_word_text(str(w.get("text") or ""))
+        if not wtoks:
             continue
-        hay.append(tok)
-        starts.append(int(ws))
-        ends.append(int(we))
 
-    if not hay or len(hay) < len(needle):
-        return None
+        # replicate timing across split tokens (okay for matching)
+        for tok in wtoks:
+            idx = len(tokens)
+            tokens.append(tok)
+            starts.append(int(ws))
+            ends.append(int(we))
+            pos.setdefault(tok, []).append(idx)
 
-    first = needle[0]
-    candidates = [i for i, t in enumerate(hay) if t == first]
+    return {"tokens": tokens, "starts": starts, "ends": ends, "pos": pos}
 
-    for i in candidates:
-        j = 0
-        k = i
-        while j < len(needle) and k < len(hay) and hay[k] == needle[j]:
-            j += 1
-            k += 1
-        if j == len(needle):
-            start_ms = starts[i]
-            end_ms = ends[k - 1]
-            return (start_ms, end_ms)
-
-    # If exact match fails (rare formatting/tokenization diffs), return None.
-    return None
-
-def attach_timestamps_from_words(clips: List[ClipSegment], words: List[Dict[str, Any]]) -> List[ClipSegment]:
-    """Mutates/returns clips with start_ms/end_ms filled when possible."""
-    for c in clips:
-        has_valid = c.start_ms is not None and c.end_ms is not None and c.end_ms > c.start_ms
-        if not has_valid:
-            span = find_clip_span_in_words(words, c.text or "")
-            if span:
-                c.start_ms, c.end_ms = span
-    return clips
 
 # ----------------------------
-# UI safety: dropdown crash fix
+# STRICT contiguous match (compatibility)
+# ----------------------------
+
+def find_clip_span_in_words_strict_index(
+    words_index: Dict[str, Any],
+    clip_text: str,
+    *,
+    max_candidates: int = 2500,
+) -> Optional[Dict[str, Any]]:
+    tokens: List[str] = words_index.get("tokens") or []
+    starts: List[int] = words_index.get("starts") or []
+    ends: List[int] = words_index.get("ends") or []
+    pos: Dict[str, List[int]] = words_index.get("pos") or {}
+
+    needle = _tokenize_text(clip_text or "")
+    if not needle or len(needle) > len(tokens):
+        return None
+
+    best_anchor = None  # (occ, j, tok)
+    for j, tok in enumerate(needle[:160]):
+        occs = pos.get(tok, [])
+        if not occs:
+            continue
+        cand = (len(occs), j, tok)
+        if best_anchor is None or cand < best_anchor:
+            best_anchor = cand
+
+    if best_anchor is None:
+        return None
+
+    _occ, j_anchor, tok_anchor = best_anchor
+    occs = pos.get(tok_anchor, [])
+    if not occs:
+        return None
+
+    if len(occs) > max_candidates:
+        step = max(1, len(occs) // max_candidates)
+        occs = occs[::step][:max_candidates]
+
+    for p in occs:
+        start_guess = p - j_anchor
+        if start_guess < 0:
+            continue
+        end_guess = start_guess + len(needle) - 1
+        if end_guess >= len(tokens):
+            continue
+        if tokens[start_guess : start_guess + len(needle)] == needle:
+            return {
+                "start_ms": int(starts[start_guess]),
+                "end_ms": int(ends[end_guess]),
+                "score": 1.0,
+                "method": "strict",
+                "span_start_idx": int(start_guess),
+                "span_end_idx": int(end_guess),
+                "matched_tokens": int(len(needle)),
+                "clip_tokens": int(len(needle)),
+                "start_guess": int(start_guess),
+                "first_match_idx": int(start_guess),
+                "lead_misses": 0,
+            }
+
+    return None
+
+
+def find_clip_span_in_words(words: List[Dict[str, Any]], clip_text: str) -> Optional[Tuple[int, int]]:
+    if not words:
+        return None
+    idx = build_words_index(words)
+    res = find_clip_span_in_words_strict_index(idx, clip_text)
+    if not res:
+        return None
+    return (int(res["start_ms"]), int(res["end_ms"]))
+
+
+def attach_timestamps_from_words(clips: List[ClipSegment], words: List[Dict[str, Any]]) -> List[ClipSegment]:
+    """
+    Compatibility function for older code:
+    - fills only if missing/invalid
+    - does NOT overwrite valid timestamps
+    """
+    for c in clips:
+        has_valid = c.start_ms is not None and c.end_ms is not None and c.end_ms > c.start_ms
+        if has_valid:
+            continue
+        span = find_clip_span_in_words(words, c.text or "")
+        if span:
+            c.start_ms, c.end_ms = span
+    return clips
+
+
+# ----------------------------
+# FUZZY alignment (PRIMARY)
+# ----------------------------
+
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "so", "to", "of", "in", "on", "for", "with",
+    "is", "are", "was", "were", "be", "been", "being", "it", "this", "that", "these", "those",
+    "i", "you", "he", "she", "we", "they", "me", "him", "her", "us", "them",
+    "my", "your", "his", "hers", "our", "their",
+    "as", "at", "by", "from", "into", "about", "over", "under", "up", "down", "out",
+    "not", "no", "yes", "do", "does", "did", "doing",
+    "have", "has", "had",
+    "with", "without",
+}
+
+def _is_number_token(t: str) -> bool:
+    return bool(re.fullmatch(r"\d+", t or ""))
+
+def _edit_distance_leq_1(a: str, b: str) -> bool:
+    """
+    Fast check: whether Levenshtein distance(a,b) <= 1
+    """
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+
+    # same length: allow one substitution
+    if la == lb:
+        diff = 0
+        for ca, cb in zip(a, b):
+            if ca != cb:
+                diff += 1
+                if diff > 1:
+                    return False
+        return True
+
+    # length differs by 1: allow one insertion/deletion
+    if la > lb:
+        a, b = b, a
+        la, lb = lb, la  # now la < lb
+
+    i = j = 0
+    edits = 0
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        else:
+            edits += 1
+            if edits > 1:
+                return False
+            j += 1  # skip one char in longer string
+    return True  # tail char counts as <=1 edit
+
+def _token_match(transcript_tok: str, clip_tok: str) -> bool:
+    if transcript_tok == clip_tok:
+        return True
+    # typo tolerance for longer words, avoids over-matching short/common tokens
+    if len(transcript_tok) >= 6 and len(clip_tok) >= 6 and (not _is_number_token(transcript_tok)) and (not _is_number_token(clip_tok)):
+        return _edit_distance_leq_1(transcript_tok, clip_tok)
+    return False
+
+
+def _pick_anchor_tokens(
+    clip_tokens: List[str],
+    pos_index: Dict[str, List[int]],
+    *,
+    max_anchors: int = 14,
+) -> List[Tuple[int, str]]:
+    if not clip_tokens:
+        return []
+
+    cands = []
+    seen = set()
+    for j, tok in enumerate(clip_tokens):
+        if tok in seen:
+            continue
+        seen.add(tok)
+        if len(tok) <= 1:
+            continue
+        occ = pos_index.get(tok, [])
+        if not occ:
+            continue
+        if tok in _STOPWORDS:
+            continue
+        cands.append((len(occ), j, tok))
+
+    cands.sort(key=lambda x: (x[0], x[1]))
+    anchors = [(j, tok) for _occ, j, tok in cands[:max_anchors]]
+    if anchors:
+        return anchors
+
+    # fallback: allow stopwords if needed
+    cands2 = []
+    seen2 = set()
+    for j, tok in enumerate(clip_tokens):
+        if tok in seen2:
+            continue
+        seen2.add(tok)
+        if len(tok) <= 1:
+            continue
+        occ = pos_index.get(tok, [])
+        if not occ:
+            continue
+        cands2.append((len(occ), j, tok))
+
+    cands2.sort(key=lambda x: (x[0], x[1]))
+    return [(j, tok) for _occ, j, tok in cands2[:max_anchors]]
+
+
+def _score_alignment_greedy(
+    transcript_tokens: List[str],
+    clip_tokens: List[str],
+    start_guess: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Key change: we return BOTH:
+      - first_match_idx (where matching actually first succeeded)
+      - start_guess (hypothesized start of the clip)
+    We should NOT set clip start to first_match_idx, because early mismatches are common.
+    """
+    n = len(transcript_tokens)
+    if n == 0 or not clip_tokens:
+        return None
+
+    max_skip = min(120, max(35, int(len(clip_tokens) * 0.10)))
+    max_misses = max(8, int(len(clip_tokens) * 0.22))
+
+    t = max(0, min(start_guess, n - 1))
+    matched_positions: List[int] = []
+    misses = 0
+    lead_misses = 0
+    saw_first_match = False
+    first_match_idx = None
+
+    for tok in clip_tokens:
+        found = False
+        for skip in range(0, max_skip + 1):
+            k = t + skip
+            if k >= n:
+                break
+            if _token_match(transcript_tokens[k], tok):
+                matched_positions.append(k)
+                t = k + 1
+                found = True
+                if not saw_first_match:
+                    saw_first_match = True
+                    first_match_idx = k
+                break
+
+        if not found:
+            misses += 1
+            if not saw_first_match:
+                lead_misses += 1
+            if misses > max_misses:
+                break
+
+    if not matched_positions:
+        return None
+
+    score = len(matched_positions) / max(1, len(clip_tokens))
+    return {
+        "span_start_idx": matched_positions[0],  # first actual match (debug)
+        "span_end_idx": matched_positions[-1],
+        "score": score,
+        "matched_tokens": len(matched_positions),
+        "clip_tokens": len(clip_tokens),
+        "start_guess": int(start_guess),
+        "first_match_idx": int(first_match_idx if first_match_idx is not None else matched_positions[0]),
+        "lead_misses": int(lead_misses),
+    }
+
+
+def find_clip_span_in_words_fuzzy(
+    words_index: Dict[str, Any],
+    clip_text: str,
+    *,
+    min_score: float = 0.70,
+    top_k_candidates: int = 40,
+) -> Optional[Dict[str, Any]]:
+    transcript_tokens: List[str] = words_index.get("tokens") or []
+    starts: List[int] = words_index.get("starts") or []
+    ends: List[int] = words_index.get("ends") or []
+    pos: Dict[str, List[int]] = words_index.get("pos") or {}
+
+    raw_clip_tokens = _tokenize_text(clip_text or "")
+    if not raw_clip_tokens or not transcript_tokens:
+        return None
+
+    filtered = [t for t in raw_clip_tokens if t not in _STOPWORDS]
+    clip_tokens = filtered if len(filtered) >= 8 else raw_clip_tokens
+
+    anchors = _pick_anchor_tokens(clip_tokens, pos, max_anchors=14)
+    if not anchors:
+        return None
+
+    votes: Dict[int, float] = {}
+    for j, tok in anchors:
+        occs = pos.get(tok, [])
+        if not occs:
+            continue
+
+        if len(occs) > 300:
+            step = max(1, len(occs) // 300)
+            occs = occs[::step][:300]
+
+        weight = 1.0 / max(1, min(len(pos.get(tok, [])), 80))
+        for p in occs:
+            s = p - j
+            if s < 0:
+                continue
+            votes[s] = votes.get(s, 0.0) + weight
+
+    if not votes:
+        return None
+
+    candidates = sorted(votes.items(), key=lambda kv: kv[1], reverse=True)[:top_k_candidates]
+
+    best: Optional[Dict[str, Any]] = None
+    for start_guess, _v in candidates:
+        res = _score_alignment_greedy(transcript_tokens, clip_tokens, start_guess)
+        if not res:
+            continue
+        if best is None or res["score"] > best["score"]:
+            best = res
+
+    if not best or best["score"] < min_score:
+        return None
+
+    ei = int(best["span_end_idx"])
+    if ei < 0 or ei >= len(ends):
+        return None
+
+    # IMPORTANT: start_ms is not decided here anymore.
+    # We return indices and let attach_timestamps decide the true start index robustly.
+    return {
+        "score": float(best["score"]),
+        "method": "fuzzy",
+        "span_end_idx": int(best["span_end_idx"]),
+        "span_start_idx": int(best["span_start_idx"]),   # first match (debug only)
+        "start_guess": int(best["start_guess"]),
+        "first_match_idx": int(best["first_match_idx"]),
+        "lead_misses": int(best["lead_misses"]),
+        "matched_tokens": int(best["matched_tokens"]),
+        "clip_tokens": int(best["clip_tokens"]),
+    }
+
+
+def attach_timestamps_from_words_fuzzy(
+    clips: List[ClipSegment],
+    words: List[Dict[str, Any]],
+    *,
+    overwrite: bool = True,
+    min_score: float = 0.70,
+    # keep buffers SMALL now; the real fix is start_guess logic
+    start_buffer_ms: int = 180,
+    end_buffer_ms: int = 180,
+    # cap how far back we allow start_guess to pull us (in tokens)
+    max_start_back_tokens: int = 60,
+    fallback_strict: bool = True,
+    keep_old_if_unmatched: bool = False,
+) -> Tuple[List[ClipSegment], List[Dict[str, Any]]]:
+    debug_rows: List[Dict[str, Any]] = []
+    if not clips:
+        return clips, debug_rows
+
+    if not words:
+        for c in clips:
+            debug_rows.append(
+                {
+                    "clip_id": c.clip_id,
+                    "matched": False,
+                    "reason": "no_words",
+                    "score": None,
+                    "lead_misses": None,
+                    "old_start": c.start_ms,
+                    "old_end": c.end_ms,
+                    "new_start": c.start_ms,
+                    "new_end": c.end_ms,
+                    "method": None,
+                }
+            )
+        return clips, debug_rows
+
+    idx = build_words_index(words)
+    starts: List[int] = idx.get("starts") or []
+    ends: List[int] = idx.get("ends") or []
+
+    for c in clips:
+        old_start, old_end = c.start_ms, c.end_ms
+
+        if not (c.text or "").strip():
+            if overwrite and not keep_old_if_unmatched:
+                c.start_ms, c.end_ms = None, None
+            debug_rows.append(
+                {
+                    "clip_id": c.clip_id,
+                    "matched": False,
+                    "reason": "empty_text",
+                    "score": None,
+                    "lead_misses": None,
+                    "old_start": old_start,
+                    "old_end": old_end,
+                    "new_start": c.start_ms,
+                    "new_end": c.end_ms,
+                    "method": None,
+                }
+            )
+            continue
+
+        res = find_clip_span_in_words_fuzzy(idx, c.text or "", min_score=min_score)
+
+        if res is None and fallback_strict:
+            strict_res = find_clip_span_in_words_strict_index(idx, c.text or "")
+            if strict_res:
+                # strict gives exact start/end indices
+                start_idx = int(strict_res["span_start_idx"])
+                end_idx = int(strict_res["span_end_idx"])
+                new_start = max(0, int(starts[start_idx]) - int(start_buffer_ms)) if starts else None
+                new_end = int(ends[end_idx]) + int(end_buffer_ms) if ends else None
+                c.start_ms, c.end_ms = new_start, new_end
+                debug_rows.append(
+                    {
+                        "clip_id": c.clip_id,
+                        "matched": True,
+                        "reason": None,
+                        "score": 1.0,
+                        "lead_misses": 0,
+                        "old_start": old_start,
+                        "old_end": old_end,
+                        "new_start": c.start_ms,
+                        "new_end": c.end_ms,
+                        "method": "strict",
+                    }
+                )
+                continue
+
+        if res:
+            # ---- CRITICAL FIX ----
+            # Use start_guess (hypothesized start) instead of first matched token.
+            start_guess = int(res.get("start_guess", -1))
+            first_match_idx = int(res.get("first_match_idx", -1))
+            lead_misses = int(res.get("lead_misses", 0))
+            end_idx = int(res.get("span_end_idx", -1))
+
+            if not starts or not ends or end_idx < 0 or end_idx >= len(ends):
+                if overwrite and not keep_old_if_unmatched:
+                    c.start_ms, c.end_ms = None, None
+                debug_rows.append(
+                    {
+                        "clip_id": c.clip_id,
+                        "matched": False,
+                        "reason": "bad_index",
+                        "score": float(res.get("score", 0.0)),
+                        "lead_misses": lead_misses,
+                        "old_start": old_start,
+                        "old_end": old_end,
+                        "new_start": c.start_ms,
+                        "new_end": c.end_ms,
+                        "method": None,
+                    }
+                )
+                continue
+
+            # pick a robust start index:
+            # - prefer start_guess
+            # - but don't allow it to be absurdly earlier than where matching begins
+            start_idx = start_guess if start_guess >= 0 else first_match_idx
+            if start_idx < 0:
+                start_idx = max(0, end_idx - 10)
+
+            # cap how far back from first_match_idx we allow start_guess to go
+            if first_match_idx >= 0 and start_idx < first_match_idx - max_start_back_tokens:
+                start_idx = max(0, first_match_idx - max_start_back_tokens)
+
+            # also, if the model had many lead misses, allow a bit more context (but bounded)
+            if first_match_idx >= 0 and lead_misses > 0:
+                extra = min(max_start_back_tokens, 2 * lead_misses)
+                start_idx = max(0, min(start_idx, first_match_idx - extra))
+
+            new_start = max(0, int(starts[start_idx]) - int(start_buffer_ms))
+            new_end = int(ends[end_idx]) + int(end_buffer_ms)
+
+            c.start_ms, c.end_ms = int(new_start), int(new_end)
+
+            debug_rows.append(
+                {
+                    "clip_id": c.clip_id,
+                    "matched": True,
+                    "reason": None,
+                    "score": float(res.get("score", 0.0)),
+                    "lead_misses": lead_misses,
+                    "old_start": old_start,
+                    "old_end": old_end,
+                    "new_start": c.start_ms,
+                    "new_end": c.end_ms,
+                    "method": res.get("method", "fuzzy"),
+                }
+            )
+        else:
+            if overwrite and not keep_old_if_unmatched:
+                c.start_ms, c.end_ms = None, None
+            debug_rows.append(
+                {
+                    "clip_id": c.clip_id,
+                    "matched": False,
+                    "reason": "no_match",
+                    "score": None,
+                    "lead_misses": None,
+                    "old_start": old_start,
+                    "old_end": old_end,
+                    "new_start": c.start_ms,
+                    "new_end": c.end_ms,
+                    "method": None,
+                }
+            )
+
+    return clips, debug_rows
+
+
+def llm_alignment_df(debug_rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for r in debug_rows or []:
+        rows.append(
+            {
+                "clip_id": r.get("clip_id"),
+                "matched": r.get("matched"),
+                "reason": r.get("reason"),
+                "score": r.get("score"),
+                "lead_misses": r.get("lead_misses"),
+                "old_start": ms_to_timestamp(r.get("old_start")),
+                "old_end": ms_to_timestamp(r.get("old_end")),
+                "new_start": ms_to_timestamp(r.get("new_start")),
+                "new_end": ms_to_timestamp(r.get("new_end")),
+                "method": r.get("method"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# ----------------------------
+# UI safety
 # ----------------------------
 
 def safe_clip_picker(label: str, clips: List[ClipSegment], key_prefix: str) -> Optional[ClipSegment]:
-    """
-    Fixes the crash when the selectbox's prior value is not in current options.
-    Keeps behavior the same, but prevents StopIteration.
-    """
     if not clips:
         return None
     options = [c.clip_id for c in clips]
@@ -439,6 +856,7 @@ def safe_clip_picker(label: str, clips: List[ClipSegment], key_prefix: str) -> O
             return c
     return clips[0]
 
+
 def clips_summary_df(clips: List[ClipSegment]) -> pd.DataFrame:
     rows = []
     for c in clips:
@@ -455,6 +873,7 @@ def clips_summary_df(clips: List[ClipSegment]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
 
 def pretty_json(x: Any) -> str:
     return json.dumps(x, ensure_ascii=False, indent=2)
