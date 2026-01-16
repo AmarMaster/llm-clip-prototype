@@ -4,3 +4,4 @@ moviepy
 requests
 feedparser
 openai
+boto3
