@@ -32,6 +32,9 @@ from .media import (
     render_clips_with_moviepy,
 )
 
+# IMPORTANT: your file is named s3_publish.py
+from .s3_publish import publish_transcript_json_to_s3
+
 try:
     import requests
 except ImportError:
@@ -55,15 +58,20 @@ class ClipComparatorApp:
     def ensure_session_state():
         ClipComparatorApp._load_dotenv()
 
-        # Episode tracking (to detect podcast changes)
-        st.session_state.setdefault("active_episode_uid", "")
+        # RSS / episode browsing (selected != active)
         st.session_state.setdefault("rss_meta", None)
-        st.session_state.setdefault("rss_episode_uid", "")
-        st.session_state.setdefault("rss_episode_title", "")
-        st.session_state.setdefault("rss_episode_audio_url", "")
-        st.session_state.setdefault("episode_video_url", "")
 
-        # Transcript state
+        # "selected" episode = what user is currently browsing in the dropdown
+        st.session_state.setdefault("selected_episode_uid", "")
+        st.session_state.setdefault("selected_episode_title", "")
+        st.session_state.setdefault("selected_episode_audio_url", "")
+        st.session_state.setdefault("selected_episode_video_url", "")
+
+        # "active" episode = the episode that the CURRENT transcript/clips belong to
+        # This only changes when user SUBMITS a new AssemblyAI job (per your requirement)
+        st.session_state.setdefault("active_episode_uid", "")
+
+        # Transcript state (belongs to active_episode_uid)
         st.session_state.setdefault("assembly_raw", None)
         st.session_state.setdefault("assembly_parsed", None)
         st.session_state.setdefault("assembly_job_id", None)
@@ -80,10 +88,13 @@ class ClipComparatorApp:
         st.session_state.setdefault("llm_alignment_debug", [])
         st.session_state.setdefault("llm_last_transcript_text", "")
 
-        # Shared URLs / UI widget keys that need to be forced on episode change
+        # URL widgets that tend to “stick”
         st.session_state.setdefault("headliner_audio_url", "")
         st.session_state.setdefault("llm_audio_url", "")
         st.session_state.setdefault("playback_media_url", "")
+
+        # Headliner transcriptUrl widget key (THIS is what must be set to pipe URL)
+        st.session_state.setdefault("headliner_transcript_url", os.environ.get("LEX_FRIDMAN_TRSCPT", ""))
 
         # alignment params
         st.session_state.setdefault("llm_align_min_score", 0.70)
@@ -95,8 +106,9 @@ class ClipComparatorApp:
         st.session_state.setdefault("rendered_headliner", None)
         st.session_state.setdefault("rendered_llm", None)
 
-        # Headliner transcript URL field (if you still use it)
-        st.session_state.setdefault("transcript_url", os.environ.get("LEX_FRIDMAN_TRSCPT", ""))
+        # S3 transcript publishing state
+        st.session_state.setdefault("s3_transcript_key", "")
+        st.session_state.setdefault("s3_transcript_url", "")
 
     @staticmethod
     def _load_dotenv():
@@ -113,53 +125,72 @@ class ClipComparatorApp:
             if key and val and key not in os.environ:
                 os.environ[key] = val
 
-    def _on_episode_change(self, ep: Dict[str, Any], new_uid: str):
+    # ----------------------------
+    # Episode selection (NO hard reset here)
+    # ----------------------------
+
+    def _set_selected_episode(self, ep: Dict[str, Any], new_uid: str):
         """
-        HARD reset relevant session state when the selected episode changes.
-        This fixes Streamlit widget state "sticking" (LLM audio URL, transcript text, moviepy URL).
+        Update "selected episode" fields and gently update URL widgets.
+        DOES NOT clear transcript/clips (per requirement).
         """
-        st.session_state["active_episode_uid"] = new_uid
+        prev_audio = st.session_state.get("selected_episode_audio_url", "")
+        prev_video = st.session_state.get("selected_episode_video_url", "")
 
         audio_url = (ep.get("audio_url") or "").strip()
         video_url = (ep.get("video_url") or "").strip()
 
-        # Update episode meta
-        st.session_state["rss_episode_uid"] = new_uid
-        st.session_state["rss_episode_title"] = ep.get("title", "")
-        st.session_state["rss_episode_audio_url"] = audio_url
-        st.session_state["episode_video_url"] = video_url
+        st.session_state["selected_episode_uid"] = new_uid
+        st.session_state["selected_episode_title"] = ep.get("title", "")
+        st.session_state["selected_episode_audio_url"] = audio_url
+        st.session_state["selected_episode_video_url"] = video_url
 
-        # Force widget keys to new defaults
-        st.session_state["headliner_audio_url"] = audio_url
-        st.session_state["llm_audio_url"] = audio_url
-        # MoviePy should default to video enclosure if present; else audio
-        st.session_state["playback_media_url"] = video_url or audio_url
+        # Only auto-update widget URLs if user hasn't manually overridden them
+        if st.session_state.get("headliner_audio_url", "") in ("", prev_audio):
+            st.session_state["headliner_audio_url"] = audio_url
 
-        # Clear transcript (because it belongs to previous episode)
+        if st.session_state.get("llm_audio_url", "") in ("", prev_audio):
+            st.session_state["llm_audio_url"] = audio_url
+
+        # playback defaults to video if present, else audio (but don't override custom)
+        desired_playback = video_url or audio_url
+        if st.session_state.get("playback_media_url", "") in ("", prev_video, prev_audio):
+            st.session_state["playback_media_url"] = desired_playback
+
+    def _hard_reset_for_new_assembly_job(self, new_active_uid: str):
+        """
+        HARD reset only when user submits a NEW AssemblyAI job (per your requirement).
+        Clears transcript/clips/render + S3 URL so nothing sticks across episodes/jobs.
+        """
+        st.session_state["active_episode_uid"] = new_active_uid
+
+        # Transcript
         st.session_state["assembly_raw"] = None
         st.session_state["assembly_parsed"] = None
         st.session_state["assembly_job_id"] = None
         st.session_state["assembly_job_status"] = None
 
-        # Clear Headliner outputs
+        # Headliner
         st.session_state["headliner_raw"] = None
         st.session_state["headliner_job_id"] = None
         st.session_state["headliner_clips"] = []
 
-        # Clear LLM outputs
+        # LLM
         st.session_state["llm_clips"] = []
         st.session_state["llm_raw"] = None
         st.session_state["llm_alignment_debug"] = []
         st.session_state["llm_last_transcript_text"] = ""
 
-        # Clear renders
+        # Renders
         st.session_state["rendered_headliner"] = None
         st.session_state["rendered_llm"] = None
 
-        # Reset transcript source selection if it becomes invalid later
-        # (radio options can change depending on whether transcript exists)
-        if "llm_source" in st.session_state:
-            st.session_state["llm_source"] = None
+        # S3 transcript URL
+        st.session_state["s3_transcript_key"] = ""
+        st.session_state["s3_transcript_url"] = ""
+
+        # Critical: reset Headliner transcriptUrl field so it never sticks
+        st.session_state["headliner_transcript_url"] = ""
 
     def run(self):
         st.title("Headliner vs LLM – Clip Generation Comparison")
@@ -176,13 +207,29 @@ class ClipComparatorApp:
     def _save_assembly_json(self, data: Dict[str, Any]):
         parsed = parse_assembly_json(data)
 
-        # Use the currently selected episode UID if available, so everything stays consistent.
-        rss_uid = (st.session_state.get("rss_episode_uid") or "").strip()
-        if rss_uid:
-            parsed["episode_id"] = rss_uid
+        # Make transcript belong to the ACTIVE episode UID (not AssemblyAI transcript ID)
+        active_uid = (st.session_state.get("active_episode_uid") or "").strip()
+        if active_uid:
+            parsed["episode_id"] = active_uid
 
         st.session_state["assembly_raw"] = data
         st.session_state["assembly_parsed"] = parsed
+
+    def _publish_loaded_transcript_to_s3(self, transcript_json: Dict[str, Any]):
+        """
+        Upload transcript JSON to S3 and pipe presigned URL into Headliner transcriptUrl widget.
+        """
+        active_uid = (st.session_state.get("active_episode_uid") or "").strip() or "episode"
+        key, presigned = publish_transcript_json_to_s3(
+            transcript_json=transcript_json,
+            episode_id=active_uid,
+            extra_metadata={"source": "assemblyai", "episode": active_uid},
+        )
+        st.session_state["s3_transcript_key"] = key
+        st.session_state["s3_transcript_url"] = presigned
+
+        # THIS is the key your Headliner text_input uses, so it will actually show up and submit correctly.
+        st.session_state["headliner_transcript_url"] = presigned
 
     def section_transcription(self):
         st.header("1) Get transcript (RSS only)")
@@ -221,15 +268,19 @@ class ClipComparatorApp:
         )
         ep = meta["episodes"][idx]
 
-        # Detect episode change early (before widgets that depend on state are rendered)
-        new_uid = _episode_uid_from_audio_url(ep.get("audio_url") or "")
-        if new_uid and new_uid != (st.session_state.get("active_episode_uid") or ""):
-            self._on_episode_change(ep, new_uid)
+        sel_uid = _episode_uid_from_audio_url(ep.get("audio_url") or "")
+        if sel_uid and sel_uid != (st.session_state.get("selected_episode_uid") or ""):
+            self._set_selected_episode(ep, sel_uid)
 
-        st.write("**Episode:**", ep.get("title", ""))
-        st.write("**Audio URL:**", ep.get("audio_url", ""))
-        if ep.get("video_url"):
-            st.write("**Video enclosure:**", ep.get("video_url", ""))
+        st.write("**Selected Episode:**", st.session_state.get("selected_episode_title", ""))
+        st.write("**Selected Audio URL:**", st.session_state.get("selected_episode_audio_url", ""))
+        if st.session_state.get("selected_episode_video_url"):
+            st.write("**Selected Video enclosure:**", st.session_state.get("selected_episode_video_url", ""))
+
+        active_uid = (st.session_state.get("active_episode_uid") or "").strip()
+        if active_uid:
+            if active_uid != (st.session_state.get("selected_episode_uid") or ""):
+                st.info("You’re browsing a different episode than the one your current transcript/clips belong to. Submit a new AssemblyAI job to switch.")
 
         aai_key_rss = st.text_input(
             "AssemblyAI API key",
@@ -239,19 +290,30 @@ class ClipComparatorApp:
         )
 
         col1, col2 = st.columns(2)
+
         with col1:
             if st.button("Submit transcription job", width="stretch", key="rss_submit"):
                 if not aai_key_rss.strip():
                     st.error("Missing AssemblyAI API key.")
                 else:
-                    try:
-                        with st.spinner("Submitting transcript job…"):
-                            tid = assemblyai_submit_transcript(aai_key_rss.strip(), ep["audio_url"])
-                        st.session_state["assembly_job_id"] = tid
-                        st.session_state["assembly_job_status"] = "submitted"
-                        st.success(f"Submitted. transcript_id={tid}")
-                    except Exception as e:
-                        st.error(f"Submit failed: {e}")
+                    audio_url = (st.session_state.get("selected_episode_audio_url") or "").strip()
+                    if not audio_url:
+                        st.error("Selected episode is missing an audio URL.")
+                    else:
+                        try:
+                            # HARD reset only when submitting a new Assembly job
+                            new_active = st.session_state.get("selected_episode_uid") or ""
+                            if new_active:
+                                self._hard_reset_for_new_assembly_job(new_active)
+
+                            with st.spinner("Submitting transcript job…"):
+                                tid = assemblyai_submit_transcript(aai_key_rss.strip(), audio_url)
+
+                            st.session_state["assembly_job_id"] = tid
+                            st.session_state["assembly_job_status"] = "submitted"
+                            st.success(f"Submitted. transcript_id={tid}")
+                        except Exception as e:
+                            st.error(f"Submit failed: {e}")
 
         with col2:
             tid = st.session_state.get("assembly_job_id") or ""
@@ -265,14 +327,25 @@ class ClipComparatorApp:
                     try:
                         with st.spinner("Polling AssemblyAI…"):
                             data = assemblyai_get_transcript(aai_key_rss.strip(), str(tid))
+
                         st.session_state["assembly_job_status"] = data.get("status")
                         st.info(f"Status: {data.get('status')}")
+
                         if data.get("status") == "completed":
                             if "words" not in data or not isinstance(data.get("words"), list):
                                 words = assemblyai_try_fetch_words(aai_key_rss.strip(), str(tid))
                                 if words:
                                     data["words"] = words
+
                             self._save_assembly_json(data)
+
+                            # Publish to S3 + pipe into Headliner transcriptUrl widget key
+                            try:
+                                self._publish_loaded_transcript_to_s3(data)
+                            except Exception:
+                                # silent by design (you still get the transcript)
+                                pass
+
                             parsed = st.session_state.get("assembly_parsed") or {}
                             st.success(
                                 f"Transcript loaded. text_chars={len(parsed.get('transcript',''))} · words={len(parsed.get('words',[]))}"
@@ -282,8 +355,23 @@ class ClipComparatorApp:
                     except Exception as e:
                         st.error(f"Poll failed: {e}")
 
-        if st.session_state.get("assembly_parsed"):
-            st.markdown("✅ Transcript loaded (LLM tab can use it).")
+        # S3 copy/paste section
+        if st.session_state.get("s3_transcript_url"):
+            st.subheader("Transcript published to S3")
+
+            st.text_input(
+                "S3 object key",
+                value=st.session_state.get("s3_transcript_key", ""),
+                disabled=True,
+                key="s3_key_display",
+            )
+
+            st.text_area(
+                "Presigned transcript URL",
+                value=st.session_state.get("s3_transcript_url", ""),
+                height=120,
+                key="s3_url_display",
+            )
 
     # ----------------------------
     # Clip generation
@@ -292,9 +380,18 @@ class ClipComparatorApp:
     def section_clip_generation(self):
         st.header("2) Generate clips")
 
+        selected_uid = (st.session_state.get("selected_episode_uid") or "").strip()
+        active_uid = (st.session_state.get("active_episode_uid") or "").strip()
+
+        # Transcript/clips/words are only “valid” for the selected episode if selected == active
+        transcript_is_for_selected = bool(active_uid and selected_uid and active_uid == selected_uid)
+
         assembly_parsed = st.session_state.get("assembly_parsed") or {}
-        episode_id = assembly_parsed.get("episode_id", "episode_1")
-        words = assembly_parsed.get("words", [])
+        episode_id = selected_uid or active_uid or assembly_parsed.get("episode_id", "episode_1")
+
+        words = []
+        if transcript_is_for_selected:
+            words = (assembly_parsed.get("words") or []) if isinstance(assembly_parsed.get("words"), list) else []
 
         tab_headliner, tab_llm = st.tabs(["Headliner", "LLM"])
 
@@ -315,20 +412,29 @@ class ClipComparatorApp:
                 except Exception as e:
                     st.error(f"Parse failed: {e}")
 
-            api_url = st.text_input("Headliner analysis endpoint URL", value=os.environ.get("HEADLINER_ENDPOINT_URL", ""), key="headliner_api_url")
+            api_url = st.text_input(
+                "Headliner analysis endpoint URL",
+                value=os.environ.get("HEADLINER_ENDPOINT_URL", ""),
+                key="headliner_api_url",
+            )
 
-            # NOTE: Because this is a widget, its value persists. We force it on episode change in _on_episode_change().
-            audio_url = st.text_input("audioUrl to send to Headliner", value=st.session_state.get("headliner_audio_url", ""), key="headliner_audio_url")
+            audio_url = st.text_input(
+                "audioUrl to send to Headliner",
+                value=st.session_state.get("headliner_audio_url", ""),
+                key="headliner_audio_url",
+            )
 
+            # THIS key is what we pipe the boto3 URL into
             transcript_url = st.text_input(
                 "transcriptUrl to send to Headliner",
-                value=st.session_state.get("transcript_url", ""),
+                value=st.session_state.get("headliner_transcript_url", ""),
                 key="headliner_transcript_url",
             )
 
+            include_transcript_default = bool(transcript_is_for_selected and st.session_state.get("assembly_raw"))
             include_transcript = st.checkbox(
                 "Attach loaded AssemblyAI transcript JSON",
-                value=bool(st.session_state.get("assembly_raw")),
+                value=include_transcript_default,
                 key="headliner_attach_transcript",
             )
 
@@ -340,14 +446,18 @@ class ClipComparatorApp:
                 else:
                     try:
                         payload: Dict[str, Any] = {"audioUrl": audio_url.strip()}
+
                         if transcript_url.strip():
                             payload["transcriptUrl"] = transcript_url.strip()
-                        if include_transcript and st.session_state.get("assembly_raw"):
+
+                        if include_transcript and transcript_is_for_selected and st.session_state.get("assembly_raw"):
                             payload["transcriptJson"] = st.session_state["assembly_raw"]
                             payload["transcriptText"] = (st.session_state.get("assembly_parsed") or {}).get("transcript", "")
+
                         headers = {"Content-Type": "application/json"}
                         with st.spinner("Submitting Headliner job…"):
                             resp = requests.post(api_url.strip(), headers=headers, json=payload, timeout=60)
+
                         if resp.status_code >= 400:
                             st.error(f"Headliner error {resp.status_code}: {resp.text[:500]}")
                         else:
@@ -358,7 +468,11 @@ class ClipComparatorApp:
                     except Exception as e:
                         st.error(f"Submit failed: {e}")
 
-            job_id = st.text_input("Headliner job id", value=str(st.session_state.get("headliner_job_id") or ""), key="headliner_job_id")
+            job_id = st.text_input(
+                "Headliner job id",
+                value=str(st.session_state.get("headliner_job_id") or ""),
+                key="headliner_job_id",
+            )
             if st.button("Poll Headliner job", width="stretch", key="headliner_poll"):
                 if not api_url.strip() or not job_id.strip():
                     st.error("Provide API URL and job id.")
@@ -390,11 +504,16 @@ class ClipComparatorApp:
             )
             llm_model = st.text_input("LLM model name", value="gpt-5.2", key="llm_model")
 
-            # This widget value sticks; we force-update it on episode change in _on_episode_change()
-            llm_audio_url = st.text_input("AUDIO_URL (required)", value=st.session_state.get("llm_audio_url", ""), key="llm_audio_url")
+            llm_audio_url = st.text_input(
+                "AUDIO_URL (required)",
+                value=st.session_state.get("llm_audio_url", ""),
+                key="llm_audio_url",
+            )
 
             llm_num_clips = st.number_input("Number of clips", min_value=1, value=20, step=1, key="llm_num_clips")
-            llm_target_seconds = st.number_input("Target clip duration (seconds)", min_value=5, value=60, step=5, key="llm_target_seconds")
+            llm_target_seconds = st.number_input(
+                "Target clip duration (seconds)", min_value=5, value=60, step=5, key="llm_target_seconds"
+            )
 
             st.session_state["llm_align_min_score"] = float(
                 st.slider("Min match score", 0.50, 0.95, float(st.session_state.get("llm_align_min_score", 0.70)), 0.01)
@@ -409,14 +528,12 @@ class ClipComparatorApp:
                 st.slider("Max start-back tokens", 10, 120, int(st.session_state.get("llm_max_start_back_tokens", 60)), 1)
             )
 
-            # Transcript source (safe even when episode changes)
-            has_loaded = st.session_state.get("assembly_parsed") is not None
+            # Only allow "Use loaded transcript" if it belongs to the selected episode
             choices = []
-            if has_loaded:
+            if transcript_is_for_selected and st.session_state.get("assembly_parsed") is not None:
                 choices.append("Use loaded transcript")
             choices += ["Upload transcript JSON file", "Paste transcript JSON", "Paste transcript text"]
 
-            # Ensure current selection is valid after episode change
             if st.session_state.get("llm_source") not in choices:
                 st.session_state["llm_source"] = choices[0]
             source = st.radio("Transcript source", choices, key="llm_source")
@@ -430,8 +547,9 @@ class ClipComparatorApp:
                 if up is not None:
                     try:
                         data = json.load(up)
-                        self._save_assembly_json(data)
-                        transcript_text = (data.get("text") or "").strip()
+                        # does NOT change active episode (per requirement)
+                        parsed = parse_assembly_json(data)
+                        transcript_text = (parsed.get("transcript") or "").strip()
                         st.success(f"Uploaded JSON. text chars: {len(transcript_text)}")
                     except Exception as e:
                         st.error(f"Invalid JSON: {e}")
@@ -443,8 +561,8 @@ class ClipComparatorApp:
                     try:
                         data = json.loads(pasted)
                         if isinstance(data, dict):
-                            self._save_assembly_json(data)
-                            transcript_text = (data.get("text") or "").strip()
+                            parsed = parse_assembly_json(data)
+                            transcript_text = (parsed.get("transcript") or "").strip()
                         else:
                             st.warning("JSON must be an object with a 'text' field.")
                     except Exception:
@@ -457,7 +575,10 @@ class ClipComparatorApp:
 
             if st.button("Generate clips with LLM", width="stretch", key="llm_generate"):
                 try:
-                    words_now = (st.session_state.get("assembly_parsed") or {}).get("words", []) or []
+                    # words only valid if transcript belongs to selected episode
+                    words_now = []
+                    if transcript_is_for_selected:
+                        words_now = (st.session_state.get("assembly_parsed") or {}).get("words", []) or []
 
                     clips, raw_out = call_llm_for_episode_clips(
                         transcript_text=transcript_text,
@@ -482,7 +603,7 @@ class ClipComparatorApp:
                             max_start_back_tokens=int(st.session_state.get("llm_max_start_back_tokens", 60)),
                         )
                     else:
-                        st.warning("No AssemblyAI words[] available; cannot realign LLM timestamps.")
+                        st.warning("No AssemblyAI words[] available for this selected episode; cannot realign LLM timestamps.")
 
                     st.session_state["llm_clips"] = clips
                     st.session_state["llm_raw"] = raw_out
@@ -491,7 +612,6 @@ class ClipComparatorApp:
 
                     matched = sum(1 for r in (debug_rows or []) if r.get("matched"))
                     st.success(f"LLM returned {len(clips)} clips. Aligned {matched}/{len(clips)}.")
-
                 except Exception as e:
                     st.error(f"LLM failed: {e}")
 
@@ -542,8 +662,15 @@ class ClipComparatorApp:
                         )
 
                 if llm:
-                    # Defensive: re-align right before render
-                    words_now = (st.session_state.get("assembly_parsed") or {}).get("words", []) or []
+                    # Defensive: re-align right before render (only if words exist and belong to selected episode)
+                    selected_uid = (st.session_state.get("selected_episode_uid") or "").strip()
+                    active_uid = (st.session_state.get("active_episode_uid") or "").strip()
+                    transcript_is_for_selected = bool(active_uid and selected_uid and active_uid == selected_uid)
+
+                    words_now = []
+                    if transcript_is_for_selected:
+                        words_now = (st.session_state.get("assembly_parsed") or {}).get("words", []) or []
+
                     if words_now:
                         llm, dbg = attach_timestamps_from_words_fuzzy(
                             llm,
@@ -583,7 +710,7 @@ class ClipComparatorApp:
         return out
 
     def section_compare(self):
-        st.header("4) Compare clips side-by-side")
+        st.header("4) Compare clips ")
 
         headliner = self._dedupe_by_clip_id(st.session_state.get("headliner_clips", []) or [])
         llm = self._dedupe_by_clip_id(st.session_state.get("llm_clips", []) or [])
